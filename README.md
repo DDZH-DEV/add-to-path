@@ -1,5 +1,7 @@
 # Windows Path Manager / Windows 环境变量管理工具
 
+![image](./func.jpg)
+
 [English](#english) | [中文](#chinese)
 
 ## English
