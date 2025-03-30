@@ -6,16 +6,16 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows/registry"
 )
 
 const (
-	regPath          = `Directory\shell\AddToPath`
-	regPathRemove    = `Directory\shell\RemoveFromPath`
-	scriptName       = "add_to_path.vbs"      // 删除
-	scriptNameRemove = "remove_from_path.vbs" // 删除
+	regPath        = `Directory\shell\AddToPath`
+	regPathRemove  = `Directory\shell\RemoveFromPath`
+	msgNeedRestart = "请注意：环境变量已更新，但必须重新打开命令窗口才能生效。\n要立即应用更改，请点击\"是\"来关闭所有cmd窗口。"
 )
 
 func main() {
@@ -265,12 +265,15 @@ func addToPath(folderPath string) error {
 		return fmt.Errorf("更新系统PATH失败: %v", err)
 	}
 
-	// 更新系统通知
-	if err := notifyEnvironmentChange(); err != nil {
-		return fmt.Errorf("通知系统环境变量更改失败: %v", err)
+	// 通知系统环境变量已更改
+	notifyEnvironmentChange()
+
+	// 询问用户是否要关闭所有CMD窗口以使更改立即生效
+	if askYesNo(msgNeedRestart) {
+		killCmdProcesses()
 	}
 
-	showMessageBox("操作成功", fmt.Sprintf("成功将 %s 添加到环境变量", folderPath))
+	showMessageBox("操作成功", fmt.Sprintf("成功将 %s 添加到环境变量\n\n若未关闭命令窗口，请记得重新打开命令窗口才能使变更生效", folderPath))
 	os.Exit(0)
 	return nil
 }
@@ -280,6 +283,10 @@ func removeFromPath(folderPath string) error {
 	if !isAdmin() {
 		return fmt.Errorf("需要管理员权限才能修改系统环境变量")
 	}
+
+	// 添加调试输出
+	fmt.Printf("准备移除的路径: %s\n", folderPath)
+	fmt.Printf("准备移除的路径(小写): %s\n", strings.ToLower(folderPath))
 
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
 		`SYSTEM\CurrentControlSet\Control\Session Manager\Environment`,
@@ -294,31 +301,82 @@ func removeFromPath(folderPath string) error {
 		return fmt.Errorf("读取PATH失败: %v", err)
 	}
 
-	paths := make(map[string]bool)
-	for _, path := range strings.Split(currentPath, ";") {
-		path = strings.TrimSpace(path)
-		if path != "" && strings.ToLower(path) != strings.ToLower(folderPath) {
-			paths[path] = true
+	// 添加调试输出
+	fmt.Println("\n当前PATH包含以下路径:")
+	for i, path := range strings.Split(currentPath, ";") {
+		if path != "" {
+			fmt.Printf("%d: [%s] (小写: [%s])\n", i, path, strings.ToLower(path))
 		}
 	}
 
-	var newPaths []string
-	for path := range paths {
-		newPaths = append(newPaths, path)
-	}
-	newPath := strings.Join(newPaths, ";")
+	// 将folderPath转为小写以便比较
+	lowerFolderPath := strings.ToLower(folderPath)
 
+	// 创建一个记录需要保留的路径的map
+	keepPaths := make([]string, 0)
+	removedPaths := make([]string, 0)
+
+	for _, path := range strings.Split(currentPath, ";") {
+		pathTrimmed := strings.TrimSpace(path)
+		if pathTrimmed == "" {
+			continue
+		}
+
+		// 比较小写版本
+		lowerPath := strings.ToLower(pathTrimmed)
+
+		if lowerPath != lowerFolderPath {
+			keepPaths = append(keepPaths, pathTrimmed)
+		} else {
+			removedPaths = append(removedPaths, pathTrimmed)
+			fmt.Printf("找到匹配项将被移除: [%s]\n", pathTrimmed)
+		}
+	}
+
+	// 添加调试信息
+	if len(removedPaths) == 0 {
+		fmt.Println("警告: 未找到要移除的路径!")
+		fmt.Printf("要移除的路径(小写): [%s]\n", lowerFolderPath)
+	}
+
+	newPath := strings.Join(keepPaths, ";")
+
+	// 添加调试输出
+	fmt.Println("\n更新后的PATH将包含以下路径:")
+	for i, path := range keepPaths {
+		fmt.Printf("%d: [%s]\n", i, path)
+	}
+
+	fmt.Println("\n以下路径将被移除:")
+	for i, path := range removedPaths {
+		fmt.Printf("%d: [%s]\n", i, path)
+	}
+
+	// 更新系统PATH
 	err = k.SetStringValue("Path", newPath)
 	if err != nil {
 		return fmt.Errorf("更新系统PATH失败: %v", err)
 	}
 
-	// 更新系统通知
-	if err := notifyEnvironmentChange(); err != nil {
-		return fmt.Errorf("通知系统环境变量更改失败: %v", err)
+	// 通知系统环境变量已更改
+	notifyEnvironmentChange()
+
+	// 构建消息
+	successMsg := fmt.Sprintf("成功从环境变量移除 %s", folderPath)
+	if len(removedPaths) == 0 {
+		successMsg = fmt.Sprintf("警告：未找到要移除的路径 %s\n可能是路径格式或大小写不匹配", folderPath)
+		showMessageBox("操作完成", successMsg)
+	} else {
+		// 询问用户是否要关闭所有CMD窗口以使更改立即生效
+		if askYesNo(msgNeedRestart) {
+			killCmdProcesses()
+			successMsg += "\n\n已尝试关闭所有命令窗口，打开新窗口即可应用更改"
+		} else {
+			successMsg += "\n\n请记得重新打开命令窗口才能使变更生效"
+		}
+		// showMessageBox("操作成功", successMsg)
 	}
 
-	showMessageBox("操作成功", fmt.Sprintf("成功从环境变量移除 %s", folderPath))
 	os.Exit(0)
 	return nil
 }
@@ -364,13 +422,25 @@ func cleanupDuplicatePaths() {
 	}
 
 	// 通知系统环境变量已更改
-	exec.Command("cmd", "/C", "echo %PATH%").Output()
+	notifyEnvironmentChange()
 
+	// 构建消息
+	var message string
 	if duplicateCount > 0 {
-		fmt.Printf("成功清理了 %d 个重复的路径\n", duplicateCount)
+		message = fmt.Sprintf("成功清理了 %d 个重复的路径", duplicateCount)
+
+		// 询问用户是否要关闭所有CMD窗口以使更改立即生效
+		if askYesNo(msgNeedRestart) {
+			killCmdProcesses()
+			message += "\n\n已尝试关闭所有命令窗口，打开新窗口即可应用更改"
+		} else {
+			message += "\n\n请记得重新打开命令窗口才能使变更生效"
+		}
 	} else {
-		fmt.Println("未发现重复的路径")
+		message = "未发现重复的路径"
 	}
+
+	showMessageBox("清理结果", message)
 }
 
 func printUsage() {
@@ -389,13 +459,92 @@ func isAdmin() bool {
 }
 
 func notifyEnvironmentChange() error {
-	// 使用 rundll32 来发送系统消息
-	cmd := exec.Command("rundll32.exe", "user32.dll,UpdatePerUserSystemParameters")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("UpdatePerUserSystemParameters 失败: %v", err)
+	// 打印提示
+	fmt.Println("环境变量已更新，尝试刷新系统缓存...")
+
+	// 1. 使用rundll32来刷新环境变量（异步执行）
+	go exec.Command("rundll32.exe", "user32.dll,UpdatePerUserSystemParameters").Run()
+
+	// 2. 直接使用Windows API广播环境变量更改消息
+	user32 := syscall.NewLazyDLL("user32.dll")
+	sendMessageTimeout := user32.NewProc("SendMessageTimeoutW")
+
+	// 使用SendMessageTimeout而不是PostMessage，确保消息被处理
+	sendMessageTimeout.Call(
+		0xFFFF, // HWND_BROADCAST
+		0x001A, // WM_SETTINGCHANGE
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Environment"))),
+		0x0002, // SMTO_ABORTIFHUNG
+		1000,   // 超时时间（毫秒）
+		0,      // 结果（不关心）
+	)
+
+	// 3. 模拟环境变量编辑器的保存操作
+	// 使用PowerShell来刷新环境变量（这类似于在GUI中保存环境变量）
+	psScript := `
+	$objShell = New-Object -ComObject WScript.Shell
+	$objEnvironment = $objShell.Environment("SYSTEM")
+	# 读取当前PATH并重新设置（模拟保存操作）
+	$path = [Environment]::GetEnvironmentVariable("Path", "Machine")
+	[Environment]::SetEnvironmentVariable("Path", $path, "Machine")
+	Write-Host "环境变量已刷新"
+	`
+
+	// 将PowerShell脚本保存到临时文件
+	tmpFile, err := os.CreateTemp("", "refresh-env-*.ps1")
+	if err == nil {
+		defer os.Remove(tmpFile.Name())
+		tmpFile.WriteString(psScript)
+		tmpFile.Close()
+
+		// 以管理员权限执行PowerShell脚本
+		go exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-File", tmpFile.Name()).Run()
 	}
 
-	// 广播环境变量更改消息
-	cmd = exec.Command("cmd", "/C", "echo %PATH%")
-	return cmd.Run()
+	// 4. 使用SETX命令再次刷新PATH变量
+	// 这会强制Windows更新环境变量缓存
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE,
+		`SYSTEM\CurrentControlSet\Control\Session Manager\Environment`,
+		registry.QUERY_VALUE)
+	if err == nil {
+		defer k.Close()
+		if currentPath, _, err := k.GetStringValue("Path"); err == nil {
+			// 创建一个临时的批处理文件来执行SETX
+			batchFile, err := os.CreateTemp("", "refresh-path-*.bat")
+			if err == nil {
+				defer os.Remove(batchFile.Name())
+				batchFile.WriteString(fmt.Sprintf("@echo off\nsetx PATH \"%s\" /M\n", currentPath))
+				batchFile.Close()
+
+				// 异步执行批处理文件
+				go exec.Command(batchFile.Name()).Run()
+			}
+		}
+	}
+
+	fmt.Println("环境变量已更新，请重新打开命令窗口才能生效")
+	return nil
+}
+
+// 添加询问用户是否/否的辅助函数
+func askYesNo(message string) bool {
+	user32 := syscall.NewLazyDLL("user32.dll")
+	messageBox := user32.NewProc("MessageBoxW")
+	result, _, _ := messageBox.Call(0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(message))),
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("确认"))),
+		0x00000004) // MB_YESNO
+
+	return result == 6 // IDYES = 6
+}
+
+// 添加尝试关闭所有CMD窗口的函数
+func killCmdProcesses() {
+	fmt.Println("正在关闭所有命令窗口...")
+	// 异步执行，不等待结果
+	go exec.Command("taskkill", "/F", "/IM", "cmd.exe").Run()
+	go exec.Command("taskkill", "/F", "/IM", "powershell.exe").Run()
+	// 等待一小段时间，让进程有时间结束
+	time.Sleep(500 * time.Millisecond)
 }
